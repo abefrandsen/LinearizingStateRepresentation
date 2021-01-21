@@ -200,6 +200,14 @@ class TeacherTrajectorySampler():
         return ([torch.from_numpy(X).float().to(self.device) for X in X_list], 
                 [torch.from_numpy(U).float().to(self.device) for U in U_list])  
     
+class FixedDatasetSampler():
+    """
+    Maintains a fixed dataset, samples from this cyclically. 
+    """
+    def __init__(self,env,device=torch.device('cpu')):
+        self.env = env
+        self.device = device
+    
 class SimpleTrajectorySampler():
     """
     Samples a batch of trajectories but stores simple (X1,X0,U) tuples.
@@ -471,7 +479,10 @@ class ConvEncoderNet(nn.Module):
         
         # create convolutional layers
         self.conv1 = nn.Conv2d(n_channels,16,8,stride=4)
+        #self.conv1.requires_grad = False
+        
         self.conv2 = nn.Conv2d(16,16,4,stride=2)
+        #self.conv2.requires_grad = False
         
         # get shape of output after convolutional layers
         shape = [self._compute_new_size(s,8,4) for s in input_shape]
@@ -481,6 +492,8 @@ class ConvEncoderNet(nn.Module):
         # create fc layers following convolutional layers
         widths = [self.size]+widths
         self.layers = nn.ModuleList([nn.Linear(widths[i],widths[i+1]) for i in range(len(widths)-1)])
+        #for l in self.layers:
+            #l.requires_grad = False
         
     def _compute_new_size(self, s_in, kern, stride):
         return int(np.floor((s_in-kern)/stride+1))
@@ -499,6 +512,7 @@ class ForwardInverseNet(nn.Module):
 
         super(ForwardInverseNet, self).__init__()
         self.encoder = encoder
+
         self.act_dim = act_dim
         self.enc_dim = enc_dim
         self.A = nn.Linear(enc_dim,enc_dim,bias=False) # drift matrix, maps state to state
@@ -528,10 +542,13 @@ class ForwardNet(nn.Module):
 
         super(ForwardNet, self).__init__()
         self.encoder = encoder
+        for p in self.encoder.parameters():
+            p.requires_grad = False
         self.act_dim = act_dim
         self.enc_dim = enc_dim
         self.A = nn.Linear(enc_dim,enc_dim,bias=False) # drift matrix, maps state to state
-        self.B = torch.eye(enc_dim)[:act_dim,:]
+        #self.B = torch.eye(enc_dim)[:act_dim,:]
+        self.B = nn.Linear(act_dim,enc_dim,bias=False)
         
     def forward_loss(self,batch):
         """
@@ -540,7 +557,8 @@ class ForwardNet(nn.Module):
         X1, X0, U = batch
         X1 = self.encoder(X1)
         X0 = self.encoder(X0)
-        state_pred = self.A(X0) + torch.matmul(U,self.B)
+        #state_pred = self.A(X0) + torch.matmul(U,self.B)
+        state_pred = self.A(X0) + self.B(U)
         return (((X1-state_pred)**2).sum()/self.enc_dim)/X1.shape[0]
        
 
@@ -574,7 +592,33 @@ class PiecewiseForwardNet(nn.Module):
                 loss += ((X1[class_inds] - pred)**2).sum()
         return loss/(self.enc_dim*X1.shape[0])
                 
-
+class MultiStepForward(nn.Module):
+    def __init__(self, encoder, t, enc_dim, act_dim):
+        super(MultiStepForward, self).__init__()
+        self.encoder = encoder
+        self.t = t
+        self.T = nn.ModuleList([nn.Linear(enc_dim,enc_dim,bias=False) for i in range(t)])
+        self.L = nn.ModuleList([nn.Linear(act_dim,enc_dim,bias=False) for i in range(t)])
+    
+    def loss(self, batch):
+        """
+        batch is a list of matrices whose columns give the x0s, x1s, ..., u0s, u1s...
+        batch = [[X0, X1, ..., Xt], [U0, U1, ..., Ut-1]]
+        """
+        X, U = batch
+        
+        # edit the following
+        enc_X_list = [self.encoder(X) for X in X_list] # encode the states Xs
+        loss = 0
+        for i in range(self.T):
+            pred = self.state_projectors[-1](enc_X_list[i+1])
+            pred -= self.state_projectors[i](enc_X_list[0])
+            for j in range(i): # previously had range(i-1) which seemed off
+                pred -= self.action_projectors[i-j-1](U_list[j])
+            loss += ((pred - U_list[i])**2).mean()
+        return loss/self.T
+        
+        
 class PredictorNet(nn.Module):
     """
     PyTorch Module object that implements the loss functions for state representation learning.
@@ -770,10 +814,70 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
 
         # print statistics
         running_loss += loss.item()
-        #running_floss += floss.item()
-        #running_iloss += iloss.item()
         if ((i+1)%track_loss_every) == 0:
             norms = [la.norm(p.detach().numpy()) for p in predNet.parameters()][-1]
+            if show_progress:
+                print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}, ConvSum: {2:.3f}".format(100*(i+1)/n_episodes,
+                                                                                           running_loss/track_loss_every,
+                                                                                          torch.sum(predNet.A.weight.data)),
+                      end="\r",flush=True)
+            losses.append(running_loss/track_loss_every)
+            running_loss = 0.0
+            
+        if ((i+1)%save_every) == 0:
+            torch.save(predNet,save_path+"_{}net".format((i+1)/save_every))
+            
+                    
+                 
+                    
+    return predNet, losses
+
+def train_encoder2(predNet, # pytorch Module-style object, encodes states and computes loss
+                   traj_sampler, # object that produces batches of trajectories
+                   n_episodes, # how many batches of trajectories to train on
+                   optimizer,
+                   lr=1e-3, #learning rate for optimizer
+                   batch_size = 50,
+                   show_progress=True,
+                   track_loss_every=10, # print a progress statement every _ batches
+                   save_every=None,
+                   save_path=None
+                  ):
+    
+    if save_every is None:
+        save_every = n_episodes
+    
+    losses = []
+    running_loss = 0.0
+    n_passes = 0
+    
+    for i in range(n_episodes):
+        # generate a batch of trajectories
+        traj_batch = traj_sampler._forward_batch(batch_size)
+        
+        # zero the parameter gradients
+        optimizer.zero_grad()
+
+        loss = predNet.forward_loss(traj_batch)
+        loss.backward()
+        optimizer.step()
+
+        # print statistics
+        running_loss += loss.item()
+        
+        """
+        # show a visualization of the representation
+        # plot a bunch of points with 0 angular velocity?
+        d = 5 # must match the final entry in layers
+        n_samps = 500
+        env = ew.TorchEncoderWrapper(env,net.encoder,np.eye(d))
+        X = np.empty((n_samps,d))
+        for i,ang in enumerate(np.linspace(0,2*np.pi,n_samps)): # go through the angles from 0 to 2pi
+            X[i,:] = env.reset(state=[ang,0])
+        utils.visualize_trajectory(X)
+        """
+
+        if ((i+1)%track_loss_every) == 0:
             if show_progress:
                 print("Epoch Completion: {0:.3f}%, Loss: {1:.3f}".format(100*(i+1)/n_episodes, running_loss/track_loss_every),
                       end="\r",flush=True)
