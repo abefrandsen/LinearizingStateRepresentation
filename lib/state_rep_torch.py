@@ -12,6 +12,9 @@ from scipy import linalg as la
 
 #device = torch.device("cuda:0")
 
+def sample_pendulum_action_batch_zero(batch_size):
+    return np.zeros((batch_size,1))
+
 def sample_car_action_batch(batch_size):
     return 2*np.random.rand(batch_size,1)-1
 
@@ -314,13 +317,16 @@ class TrajectorySampler():
     drift_action : optional, specifies what the drift action should be. Defaults to all zeros.
     device : optional, specifies which device to perform computation on (default gpu)
     """
-    def __init__(self,env,action_sampler,state_sampler,drift_action=None,device=torch.device('cpu'),
+    def __init__(self,env,action_sampler,state_sampler,T,drift_action=None,device=torch.device('cpu'),
                  deterministic=False,
-                 deterministic_args = None):
+                 deterministic_args = None,
+                method="full"):
         self.env = env
         self.action_sampler = action_sampler
         self.state_sampler = state_sampler
         self.deterministic=deterministic
+        self.method = method
+        self.T = T
         self.traj_method = {"full" : self._full_batch,
                             "full2" : self._full_batch,
                             "drift1" : self._drift1_batch,
@@ -352,14 +358,14 @@ class TrajectorySampler():
  
     
     
-    def get_new_batch(self,batch_size,T,method):
+    def get_new_batch(self,batch_size):
         """
         sample a fresh batch from the environment.
         """
-        return self.traj_method[method](batch_size,T)
+        return self.traj_method[self.method](batch_size,self.T)
         
         
-    def get_batch(self,batch_size,T,method):
+    def get_batch(self,batch_size):
         """
         Sample a batch of trajectories.
         
@@ -370,7 +376,7 @@ class TrajectorySampler():
         method : string, specifies which type of trajectory to sample
         """
         if not self.deterministic:
-            return self.get_new_batch(batch_size,T,method)
+            return self.get_new_batch(batch_size)
         else:
             batch = self.batches[self.batch_index]
             self.batch_index = (self.batch_index + 1)%self.n_batches
@@ -458,6 +464,18 @@ class EncoderNet(nn.Module):
             z = F.relu(layer(z))
         return z
 
+class SoftmaxNet(nn.Module):
+    def __init__(self, widths):
+        super(SoftmaxNet, self).__init__()
+        self.layers = nn.ModuleList([nn.Linear(widths[i],widths[i+1]) for i in range(len(widths)-1)])
+        
+    def forward(self, x):
+        z = x
+        for layer in self.layers[:-1]:
+            z = F.relu(layer(z))
+        z = nn.Softmax(dim=-1)(self.layers[-1](z))
+        return z    
+
     
 class ConvEncoderNet(nn.Module):
     """
@@ -506,6 +524,121 @@ class ConvEncoderNet(nn.Module):
             z = self.sigma(layer(z))
            
         return self.layers[-1](z)
+    
+
+class MixtureForwardNet(nn.Module):
+    def __init__(self, encoder, enc_dim, act_dim, k, mixer, fit_reward=False,mu=0, r_encoder = None, alpha=1, mean_coeff=0,covar_coeff=0,normalize=False):
+        super(MixtureForwardNet, self).__init__()
+        self.encoder = encoder
+        self.act_dim = act_dim
+        self.enc_dim = enc_dim
+        self.k = k
+        self.Alist = nn.ModuleList([nn.Linear(enc_dim,enc_dim,bias=False) for i in range(k)])
+        self.Blist = nn.ModuleList([nn.Linear(act_dim,enc_dim,bias=False) for i in range(k)])
+        self.mixer = mixer
+        self.fit_reward = fit_reward
+        self.mu = mu
+        self.alpha = alpha
+        self.r_encoder = r_encoder
+        self.covar_coeff=covar_coeff
+        self.mean_coeff=mean_coeff
+        self.normalize = normalize
+    
+    def regularizer(self,batch):
+        if self.fit_reward:
+            X1, X0, U, R = batch
+        else:
+            X1, X0, U = batch
+        X0 = self.encoder(X0)
+        batch_size = X0.shape[0]
+        mean_loss = (torch.mean(X0,0)**2).sum()
+        covar_loss = ((torch.matmul(X0.T, X0)/batch_size - torch.eye(self.enc_dim))**2).sum()
+        return self.mean_coeff * mean_loss + self.covar_coeff * covar_loss
+    
+    def forward_loss(self,batch):
+        if self.fit_reward:
+            X1, X0, U, R = batch
+        else:
+            X1, X0, U = batch
+        X1 = self.encoder(X1)
+        X0 = self.encoder(X0)
+        batch_size = X0.shape[0]
+        # batch * k
+        coeffs = self.mixer(X0)
+        #print(coeffs)
+        # batch * k * dim
+        outputs = torch.cat([(A(X0)+B(U))[:,None,:] for (A,B) in zip(self.Alist,self.Blist)],dim=1)
+        # batch * dim
+        #print(coeffs.shape, outputs.shape)
+        #outputs = outputs[:,:,None]
+        coeffs = coeffs[:,None,:]
+        #print(coeffs.shape, outputs.shape)
+        pred = torch.matmul(coeffs, outputs)[:,0,:]
+        loss = 0
+        #mean_loss = (torch.mean(X0,0)**2).sum()
+        #covar_loss = ((torch.matmul(X0.T, X0)/batch_size - torch.eye(self.enc_dim))**2).sum()
+        if self.normalize:
+            norm_factor = (torch.inverse(torch.matmul(X0.T, X0)/batch_size))
+            unnorm_err = X1-pred 
+            #print(X1.shape, pred.shape, unnorm_err.shape, norm_factor.shape)
+            loss += self.alpha*(torch.mm(torch.mm(unnorm_err,norm_factor), unnorm_err.T)).sum()    
+        else:
+            loss += self.alpha*((X1 - pred)**2).sum()
+        if self.fit_reward:
+            r_input = torch.cat([X0,X1,U], dim=1)
+            pred_rs = self.r_encoder(r_input)
+            R = R[:,None]
+            loss += self.mu*((R - pred_rs)**2).sum()
+        loss /= batch_size #(self.enc_dim*batch_size)
+        #loss += self.mean_coeff * mean_loss + self.covar_coeff * covar_loss
+        return loss
+    
+    
+class MixtureBNForwardNet(nn.Module):
+    def __init__(self, encoder, enc_dim, act_dim, k, mixer, fit_reward=False,mu=0, r_encoder = None, alpha=1):
+        super(MixtureBNForwardNet, self).__init__()
+        self.encoder = encoder
+        self.act_dim = act_dim
+        self.enc_dim = enc_dim
+        self.k = k
+        self.Alist = nn.ModuleList([nn.Linear(enc_dim,enc_dim,bias=False) for i in range(k)])
+        self.Blist = nn.ModuleList([nn.Linear(act_dim,enc_dim,bias=False) for i in range(k)])
+        self.mixer = mixer
+        self.fit_reward = fit_reward
+        self.mu = mu
+        self.alpha = alpha
+        self.r_encoder = r_encoder
+        self.bn1 = nn.BatchNorm1d(enc_dim)
+        self.bn2 = nn.BatchNorm1d(enc_dim)
+    
+    def forward_loss(self,batch):
+        if self.fit_reward:
+            X1, X0, U, R = batch
+        else:
+            X1, X0, U = batch
+        X1 = self.bn1(self.encoder(X1))
+        X0 = self.bn2(self.encoder(X0))
+        # is it ok for these two bn layers to be shared?
+        batch_size = X0.shape[0]
+        # batch * k
+        coeffs = self.mixer(X0)
+        #print(coeffs)
+        # batch * k * dim
+        outputs = torch.cat([(A(X0)+B(U))[:,None,:] for (A,B) in zip(self.Alist,self.Blist)],dim=1)
+        # batch * dim
+        #print(coeffs.shape, outputs.shape)
+        pred = torch.matmul(coeffs, outputs)
+        loss = 0
+        loss += self.alpha*((X1 - pred)**2).sum()
+        if self.fit_reward:
+            r_input = torch.cat([X0,X1,U], dim=1)
+            pred_rs = self.r_encoder(r_input)
+            R = R[:,None]
+            loss += self.mu*((R - pred_rs)**2).sum()
+        loss /= batch_size #(self.enc_dim*batch_size)
+        return loss    
+    
+    
     
 class ForwardInverseNet(nn.Module):
     def __init__(self,encoder,enc_dim, act_dim):
@@ -594,29 +727,36 @@ class PiecewiseForwardNet(nn.Module):
                 
 class MultiStepForward(nn.Module):
     def __init__(self, encoder, t, enc_dim, act_dim):
+        """
+        Parameters
+        ----------
+        t : integer, length of the trajectory
+        encoder : state representation encoder
+        enc_dim, act_dim : dimensions of representation and action
+        """
         super(MultiStepForward, self).__init__()
         self.encoder = encoder
         self.t = t
         self.T = nn.ModuleList([nn.Linear(enc_dim,enc_dim,bias=False) for i in range(t)])
         self.L = nn.ModuleList([nn.Linear(act_dim,enc_dim,bias=False) for i in range(t)])
+        #self.L0 = torch.eye(enc_dim)[:act_dim,:]
     
     def loss(self, batch):
         """
         batch is a list of matrices whose columns give the x0s, x1s, ..., u0s, u1s...
         batch = [[X0, X1, ..., Xt], [U0, U1, ..., Ut-1]]
         """
-        X, U = batch
+        X_list, U = batch
         
         # edit the following
         enc_X_list = [self.encoder(X) for X in X_list] # encode the states Xs
         loss = 0
-        for i in range(self.T):
-            pred = self.state_projectors[-1](enc_X_list[i+1])
-            pred -= self.state_projectors[i](enc_X_list[0])
-            for j in range(i): # previously had range(i-1) which seemed off
-                pred -= self.action_projectors[i-j-1](U_list[j])
-            loss += ((pred - U_list[i])**2).mean()
-        return loss/self.T
+        for n in range(1,self.t+1):
+            pred = self.T[n-1](enc_X_list[0])
+            for i in range(n):
+                pred += self.L[n-i-1](U[i])
+            loss += ((pred - enc_X_list[n])**2).mean()
+        return loss/self.t
         
         
 class PredictorNet(nn.Module):
@@ -790,6 +930,79 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
     for i in range(n_episodes):
         # generate a batch of trajectories
         if not use_teacher:
+            traj_batch = traj_sampler.get_batch(batch_size)
+            #traj_batch = traj_sampler._forward_batch(batch_size)
+        else:
+            if (i+1)%refresh_trajectories_every==0:
+                traj_sampler._create_trajectories() # create a new set of trajectories from teacher states
+            traj_batch = traj_sampler.get_batch(batch_size)
+
+        if passes is not None:
+            cached_trajectories.append(traj_batch)
+
+        # zero the parameter gradients
+        optimizer.zero_grad()
+
+        # forward + backward + optimize
+        #floss = predNet.forward_loss(traj_batch,loss_method)
+        #iloss = predNet.inverse_loss(traj_batch,loss_method)
+        #lam = .01 # .05 worked a couple times
+        #loss = lam*floss + (1-lam)*iloss
+        #loss = predNet.forward_loss(traj_batch)
+        #loss = predNet._full_loss(traj_batch)
+        loss = predNet.loss(traj_batch)
+        
+        loss.backward()
+        optimizer.step()
+
+        # print statistics
+        running_loss += loss.item()
+        if ((i+1)%track_loss_every) == 0:
+            #norms = [la.norm(p.detach().numpy()) for p in predNet.parameters()][-1]
+            if show_progress:
+                print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}".format(100*(i+1)/n_episodes,
+                                                                                           running_loss/track_loss_every))#,
+                      #end="\r",flush=True)
+            losses.append(running_loss/track_loss_every)
+            running_loss = 0.0
+            
+        if ((i+1)%save_every) == 0:
+            torch.save(predNet,save_path+"_{}net".format((i+1)/save_every))
+            
+                    
+                 
+                    
+    return predNet, losses
+def train_encoder3(predNet, # pytorch Module-style object, encodes states and computes loss
+                  traj_sampler, # object that produces batches of trajectories
+                  n_episodes, # how many batches of trajectories to train on
+                  lr=1e-3, #learning rate for optimizer
+                  batch_size = 50,
+                  show_progress=True,
+                  track_loss_every=10, # print a progress statement every _ batches
+                  save_every=None,
+                  save_path=None,
+                  use_teacher=False,
+                  passes=None, # either an integer (number of passes to iterate over cached trajectories) or None
+                  refresh_trajectories_every=np.inf, # specifies how often to create new trajectories from the teacher states
+                 ):
+    
+    if save_every is None:
+        save_every = n_episodes
+    
+    # initialize optimizer
+    optimizer = optim.Adam(predNet.parameters(),lr=lr)
+    losses = []
+    running_loss = 0.0
+    n_passes = 0
+    
+    if passes is not None:
+        cached_trajectories = []
+        n_passes = passes
+    
+    for i in range(n_episodes):
+        # generate a batch of trajectories
+        if not use_teacher:
             #traj_batch = traj_sampler.get_batch(batch_size,T,traj_method)
             traj_batch = traj_sampler._forward_batch(batch_size)
         else:
@@ -808,18 +1021,20 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
         #iloss = predNet.inverse_loss(traj_batch,loss_method)
         #lam = .01 # .05 worked a couple times
         #loss = lam*floss + (1-lam)*iloss
-        loss = predNet.forward_loss(traj_batch)
+        fwd = predNet.forward_loss(traj_batch)
+        reg = predNet.regularizer(traj_batch)
+        loss = fwd+reg
         loss.backward()
         optimizer.step()
 
         # print statistics
-        running_loss += loss.item()
+        running_loss += fwd.item()
+        #running_floss += floss.item()
+        #running_iloss += iloss.item()
         if ((i+1)%track_loss_every) == 0:
             norms = [la.norm(p.detach().numpy()) for p in predNet.parameters()][-1]
             if show_progress:
-                print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}, ConvSum: {2:.3f}".format(100*(i+1)/n_episodes,
-                                                                                           running_loss/track_loss_every,
-                                                                                          torch.sum(predNet.A.weight.data)),
+                print("Epoch Completion: {0:.3f}%, forward loss: {1:.3f}".format(100*(i+1)/n_episodes, running_loss/track_loss_every),
                       end="\r",flush=True)
             losses.append(running_loss/track_loss_every)
             running_loss = 0.0
@@ -831,7 +1046,6 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
                  
                     
     return predNet, losses
-
 def train_encoder2(predNet, # pytorch Module-style object, encodes states and computes loss
                    traj_sampler, # object that produces batches of trajectories
                    n_episodes, # how many batches of trajectories to train on

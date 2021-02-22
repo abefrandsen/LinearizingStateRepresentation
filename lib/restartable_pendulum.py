@@ -12,7 +12,7 @@ class RestartablePendulumEnv(gym.Env):
         'video.frames_per_second' : 30
     }
 
-    def __init__(self, g=10.0,repeats=1,pixels=False,cost="classic"):
+    def __init__(self, g=10.0,repeats=1,pixels=False,cost="classic",render_style="custom"):
         self.cost = cost
         self.max_speed=8
         self.max_torque=2.
@@ -21,6 +21,7 @@ class RestartablePendulumEnv(gym.Env):
         self.viewer = None
         self.pixels = pixels
         self.repeats = repeats
+        self.render_style = render_style # specifies whether to use default rendering or custom
         self.action_space = spaces.Box(low=-self.max_torque, high=self.max_torque, shape=(1,), dtype=np.float32)
         self.seed()
         
@@ -98,7 +99,10 @@ class RestartablePendulumEnv(gym.Env):
     
     def _get_obs(self):
         if self.pixels:
-            return self._get_pixels()
+            if self.render_style=="default":
+                return self.render(mode="rgb_array")
+            else:
+                return self._get_pixels()
         else: 
             theta, thetadot = self.state
             return np.array([np.cos(theta), np.sin(theta), thetadot])
