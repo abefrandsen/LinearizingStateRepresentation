@@ -1,3 +1,6 @@
+import sys
+sys.path.insert(1, '/home/home3/abef/research/control/LinearizingStateRepresentation/')
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,6 +9,12 @@ import torch.optim as optim
 from matplotlib import pyplot as plt
 import gym
 from scipy import linalg as la
+import itertools
+from gym.wrappers.time_limit import TimeLimit
+from lib.restartable_pendulum import RestartablePendulumEnv
+import lib.encoder_wrappers as ew
+from stable_baselines.common.vec_env import DummyVecEnv
+
 
 # format a batch as a list of states (each entry of list is shape (batch_size, state_size), corresponding to x0, x1,...)
 # and list of actions (each entry of shape (batch_size, action_size), u0,u1,...)
@@ -211,6 +220,55 @@ class FixedDatasetSampler():
         self.env = env
         self.device = device
     
+
+class PolicyTrajectorySampler():
+    """
+    Given a policy and environment, sample a batch of trajectories.
+    
+    Parameters
+    ----------
+    env : gym-like environment object (needs reset and step methods)
+    pol : stable-baselines-like model (needs a predict method to get action)
+    T : integer, trajectory length to be gathered
+    
+    """
+    def __init__(self, env, pol, T, device=torch.device('cpu')):
+        self.env = env
+        self.pol = pol
+        self.device = device
+        self.T = T
+        self.obs_shape = env.observation_space.shape
+        self.act_shape = env.action_space.shape
+        
+    def get_trajectory(self):
+        states = []
+        actions = []
+        x = self.env.reset()
+        states.append(x)
+        for _ in range(self.T):
+            u = self.pol.predict(x)
+            x = self.env.step(u)[0]
+            actions.append(u)
+            states.append(x)
+        return states, actions
+    
+    def get_batch(self,batch_size):
+        trajectories = [self.get_trajectory() for _ in range(batch_size)]
+        tups = []
+        for i in range(self.T):
+            X1 = np.empty((batch_size, *self.obs_shape))
+            X0 = np.empty((batch_size, *self.obs_shape))
+            U = np.empty((batch_size, *self.act_shape))
+            for j in range(batch_size):
+                X0[j,:] = trajectories[j][0][i]
+                X1[j,:] = trajectories[j][0][i+1]
+                U[j,:] = trajectories[j][1][i]
+            tups.append([torch.from_numpy(T).float().to(self.device) for T in [X1, X0, U]])
+        return tups
+            
+        
+        
+    
 class SimpleTrajectorySampler():
     """
     Samples a batch of trajectories but stores simple (X1,X0,U) tuples.
@@ -259,7 +317,7 @@ class SimpleTrajectorySampler():
         """
         sample a fresh batch from the environment.
         """
-        return self._full_batch(batch_size,T)
+        return self._forward_batch(batch_size,T)
         
         
     def get_batch(self,batch_size,T,method):
@@ -671,18 +729,24 @@ class ForwardInverseNet(nn.Module):
         return (((U-act_pred)**2).sum()/self.act_dim)/X1.shape[0]
 
 class ForwardNet(nn.Module):
-    def __init__(self,encoder,enc_dim, act_dim):
+    def __init__(self,encoder,enc_dim, act_dim, fixed_B = False):
 
         super(ForwardNet, self).__init__()
         self.encoder = encoder
+        self.fixed_B = fixed_B
         for p in self.encoder.parameters():
             p.requires_grad = False
         self.act_dim = act_dim
         self.enc_dim = enc_dim
         self.A = nn.Linear(enc_dim,enc_dim,bias=False) # drift matrix, maps state to state
-        #self.B = torch.eye(enc_dim)[:act_dim,:]
-        self.B = nn.Linear(act_dim,enc_dim,bias=False)
+        if fixed_B:
+            self.B = torch.eye(enc_dim)[:act_dim,:]
+        else:
+            self.B = nn.Linear(act_dim,enc_dim,bias=False)
         
+    def loss(self,batch):
+        return self.forward_loss(batch)
+    
     def forward_loss(self,batch):
         """
         batch : list/tuple of 3 tensors, corresponding to X1, X0, and U
@@ -690,8 +754,10 @@ class ForwardNet(nn.Module):
         X1, X0, U = batch
         X1 = self.encoder(X1)
         X0 = self.encoder(X0)
-        #state_pred = self.A(X0) + torch.matmul(U,self.B)
-        state_pred = self.A(X0) + self.B(U)
+        if self.fixed_B:
+            state_pred = self.A(X0) + torch.matmul(U,self.B)
+        else:
+            state_pred = self.A(X0) + self.B(U)
         return (((X1-state_pred)**2).sum()/self.enc_dim)/X1.shape[0]
        
 
@@ -739,7 +805,14 @@ class MultiStepForward(nn.Module):
         self.t = t
         self.T = nn.ModuleList([nn.Linear(enc_dim,enc_dim,bias=False) for i in range(t)])
         self.L = nn.ModuleList([nn.Linear(act_dim,enc_dim,bias=False) for i in range(t)])
-        #self.L0 = torch.eye(enc_dim)[:act_dim,:]
+        
+        # initiaze L_0 and fix it
+        with torch.no_grad():
+            self.L[0].weight = torch.nn.Parameter(torch.eye(enc_dim)[:,:act_dim])
+        self.L[0].requires_grad_(False)
+            
+        
+        
     
     def loss(self, batch):
         """
@@ -917,6 +990,13 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
     if save_every is None:
         save_every = n_episodes
     
+    env = traj_sampler.env
+    angs = np.linspace(-np.pi, np.pi, 5)[:-1] # test angles
+    vels = np.linspace(-8, 8, 5) # test velocities
+    test_states = np.array(list(itertools.product(angs,vels)))
+    X0 = np.empty((len(test_states),*(env.observation_space.shape)))
+    for j in range(len(test_states)):
+        X0[j,:] = env.reset(state=test_states[j])
     # initialize optimizer
     optimizer = optim.Adam(predNet.parameters(),lr=lr)
     losses = []
@@ -958,11 +1038,21 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
         # print statistics
         running_loss += loss.item()
         if ((i+1)%track_loss_every) == 0:
+            #T_norm = la.norm(predNet.T[0].weight.detach().numpy())
             #norms = [la.norm(p.detach().numpy()) for p in predNet.parameters()][-1]
+            
+            X_enc = predNet.encoder(torch.from_numpy(X0).float()).detach().numpy()
+            cov = np.dot(X_enc.T,X_enc)
+
+
             if show_progress:
-                print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}".format(100*(i+1)/n_episodes,
-                                                                                           running_loss/track_loss_every))#,
-                      #end="\r",flush=True)
+                print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}, mean: {2:.4f}, top_singular: {3:.4f}, L0: {4:.3f}".format(
+                    100*(i+1)/n_episodes,
+                    running_loss/track_loss_every,
+                    X_enc.mean(),
+                    la.svdvals(cov)[0],
+                    predNet.L[0].weight.detach().numpy().sum()))
+                     
             losses.append(running_loss/track_loss_every)
             running_loss = 0.0
             
@@ -973,6 +1063,101 @@ def train_encoder(predNet, # pytorch Module-style object, encodes states and com
                  
                     
     return predNet, losses
+
+def train_encoder_policy(predNet, # pytorch Module-style object, encodes states and computes loss
+                          traj_sampler, # object that produces batches of trajectories
+                          n_episodes, # how many batches of trajectories to train on
+                          #POL, # stable baselines policy network
+                          #ALG, # stable baselines policy algorithm
+                          #alg_kwargs,
+                          #pol_kwargs,
+                     
+                          model,
+                          pol_timesteps, # how many steps to learn the policy in each iteration
+                          outer_loop,
+                          lr=1e-3, #learning rate for optimizer
+                          batch_size = 50,
+                          show_progress=True,
+                          track_loss_every=10, # print a progress statement every _ batches
+                          save_every=None,
+                          save_path=None,
+                          use_teacher=False,
+                          passes=None, # either an integer (number of passes to iterate over cached trajectories) or None
+                          refresh_trajectories_every=np.inf, # specifies how often to create new trajectories from the teacher states
+                         ):
+    
+    if save_every is None:
+        save_every = n_episodes
+    
+    env = traj_sampler.env
+    # initialize optimizer
+    optimizer = optim.Adam(predNet.parameters(),lr=lr)
+    losses = []
+    
+    for _ in range(outer_loop): # first do some encoder training steps, then train the policy for some steps
+    
+
+        running_loss = 0.0
+
+        for i in range(n_episodes):
+            # generate a batch of trajectories
+            traj_batch = traj_sampler.get_batch(batch_size)
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+
+            # forward + backward + optimize
+            #floss = predNet.forward_loss(traj_batch,loss_method)
+            #iloss = predNet.inverse_loss(traj_batch,loss_method)
+            #lam = .01 # .05 worked a couple times
+            #loss = lam*floss + (1-lam)*iloss
+            #loss = predNet.forward_loss(traj_batch)
+            #loss = predNet._full_loss(traj_batch)
+            loss = predNet.loss(traj_batch,"full")
+
+            loss.backward()
+            optimizer.step()
+
+            # print statistics
+            running_loss += loss.item()
+            if ((i+1)%track_loss_every) == 0:
+                #T_norm = la.norm(predNet.T[0].weight.detach().numpy())
+                #norms = [la.norm(p.detach().numpy()) for p in predNet.parameters()][-1]
+
+                
+
+
+                if show_progress:
+                    print("Epoch Completion: {0:.3f}%, Loss: {1:.5f}".format(
+                        100*(i+1)/n_episodes,
+                        running_loss/track_loss_every),end="\r",flush=True)
+
+                losses.append(running_loss/track_loss_every)
+                running_loss = 0.0
+
+            if ((i+1)%save_every) == 0:
+                torch.save(predNet,save_path+"_{}net".format((i+1)/save_every))
+            
+                    
+        # initialize env with latest encoder
+        def make_policy_env():
+            repeats = 3
+            pol_env = RestartablePendulumEnv(repeats=repeats,pixels=True) # can specify cost="dm_control"
+            pol_env = TimeLimit(pol_env,max_episode_steps=int(200/repeats)) # only run the environment for 200 true steps
+            proj = [p.data.numpy() for p in predNet.state_projectors.parameters()]
+            proj = np.row_stack(proj)
+            svd = la.svd(proj, full_matrices=False)
+            proj = svd[2][:5]
+            return ew.TorchEncoderWrapper(pol_env,predNet.encoder,proj)
+        
+        pol_env = DummyVecEnv([make_policy_env])
+        
+
+        model.env = pol_env
+        model.learn(total_timesteps=pol_timesteps)
+                    
+    return predNet, losses
+
 def train_encoder3(predNet, # pytorch Module-style object, encodes states and computes loss
                   traj_sampler, # object that produces batches of trajectories
                   n_episodes, # how many batches of trajectories to train on
